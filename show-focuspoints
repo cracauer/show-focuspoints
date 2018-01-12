@@ -1,0 +1,159 @@
+#! /usr/bin/env python
+
+import sys
+import subprocess
+import re
+import argparse
+import os
+
+parser = argparse.ArgumentParser(description='Show focus points')
+parser.add_argument('-n', '--noexec', help='do not call gmic, just print shell command to use', action='store_const', const=True)
+parser.add_argument('-m', '--mode', default=[1], help='set mode.  1=new pic with points, 2=transparent points', nargs=1, type=int)
+parser.add_argument('infile', help='input file (photo with focuspoints)', nargs=1)
+parser.add_argument('outfile', help='output file (will have focuspoints markings)', nargs=1)
+
+args = parser.parse_args()
+
+#print(args)
+#print(args.noexec)
+
+picfile = args.infile[0]
+# todo: check that requested output image format supports
+# transparency when mode 2 was also requested
+outfile = args.outfile[0]
+mode = args.mode[0]
+
+newcmd = []
+
+# this should be safe against shell escape characters
+pipe = subprocess.Popen(["exiftool", picfile], bufsize=1, stdout=subprocess.PIPE)
+f = pipe.stdout
+
+width = -1
+height = -1
+
+widths = []
+heights = []
+xs = []
+ys = []
+afps_selected = {}
+afps_infocus = {}
+
+# fixme, ask a Nikon user to send a photo or a diff
+re1 = re.compile("Canon Image (Width|Height) *: *(\d+)")
+re2 = re.compile("AF Points In Focus *: *(.*)")
+re3 = re.compile("AF Points Selected *: *(.*)")
+
+re4 = []
+for pair in [[0, "Widths"], [1, "Heights"], [2, "X Positions"], [3, "Y Positions"]]:
+    re4.append(re.compile("AF Area " + pair[1] + " *: *(.*)"))
+
+for buffer in f:
+    line = buffer.decode('utf-8')
+    match = re1.match(line)
+    if match:
+        num = int(match.group(2))
+        if match.group(1) == "Width":
+            width = num
+        if match.group(1) == "Height":
+            height = num
+
+    match = re2.match(line)
+    if match:
+        things = match.group(1).split(",")
+        for thing in things:
+            # fixme, this sometimes fails, not an int
+            afps_infocus[int(thing)] = 42
+    match = re3.match(line)
+    if match:
+        things = match.group(1).split(",")
+        for thing in things:
+            # fixme, this sometimes fails, not an int
+            afps_selected[int(thing)] = 42
+                       
+    for pair in [[0, widths], [1, heights], [2, xs], [3, ys]]:
+        # print re4[pair[0]]
+        match = re.match(re4[pair[0]], line)
+        if match:
+            things = match.group(1).split()
+            for thing in things:
+                pair[1].append(int(thing))
+
+#debug                
+#print("w/h %d %d" % (width, height))
+#print(afps_infocus)
+#print(afps_selected)
+#print(xs)
+
+def appends(list, *args):
+    for thing in args:
+        list.append(thing)
+
+appends(newcmd, "gmic", picfile)
+
+# If we want to create a transparent layer we still import the original
+# image first (to get size etc), then we paint the actual pixels over
+# with transparency.
+if mode == 2:
+    appends(newcmd, "-to_rgba", "-fill", "[128,128,128,0]")
+
+# in exif, are focus points in an array that is 0-indexed or 1-indexed?
+# canon 5d clearly seems to be 0-indexed
+indexoffset = 0
+for idx, x in enumerate(xs):
+    selected = False
+    infocus = False
+    if (idx + indexoffset) in afps_selected:
+        selected = True
+    if (idx + indexoffset) in afps_infocus:
+        infocus = True
+
+    color = "255,0,0"
+    opacity = 0.3
+    if (selected):
+        color = "0,255,255"
+        opacity = 0.5
+    if (infocus):
+        color = "255,255,0"
+        opacity = 0.5
+    if (selected and infocus):
+        color = "255,255,255"
+        opacity = 0.5
+
+    y = ys[idx]
+    center_x = width / 2.0 + x
+    center_y = height / 2.0 - y # might be "- y"
+    from_x = center_x - widths[idx]
+    from_y = center_y + heights[idx]
+    appends(newcmd, "-arrow", format("%d,%d,%d,%d,3,50,50,%f,%s" % (from_x, from_y, center_x, center_y, opacity, color)))
+    #print format("    -arrow %d,%d,%d,%d,3,50,50,%f,%s \\" % (from_x, from_y, center_x, center_y, opacity, color))
+    # 0 is angle
+    appends(newcmd, "-ellipse", format("%d,%d,%d,%d,0,%f,0x1,%s" % (center_x, center_y, widths[idx], heights[idx], 1-(1 - opacity)**2, color)))
+    #print format("    -ellipse %d,%d,%d,%d,0,%f,0x1,%s \\" % (center_x, center_y, widths[idx], heights[idx], 1-(1 - opacity)**2, color))
+    appends(newcmd, "-ellipse", format("%d,%d,%d,%d,0,%f,0x1,0" % (center_x, center_y, widths[idx]+1, heights[idx]+1, opacity)))
+    #print format("    -ellipse %d,%d,%d,%d,0,%f,0x1,0" % (center_x, center_y, widths[idx]+1, heights[idx]+1, opacity))
+
+appends(newcmd, "-o", outfile)
+
+def pm(thing):
+    sys.stdout.write(str(thing))
+
+firstp = True
+if args.noexec == True:
+    for arg in newcmd:
+        if not firstp:
+            pm(" \\\n")
+        else:
+            firstp = False
+        if arg.find("'") != -1:
+            if arg.find('"') != -1:
+                print("Filename looks too strange")
+                sys.exit(42)
+            else:
+                pm("  \"%s\"" % (arg))
+        else:
+            pm("  '%s'" % (arg))
+    pm("\n")
+else:
+    # this should be safe against shell escape characters
+    os.execvp("gmic", newcmd)
